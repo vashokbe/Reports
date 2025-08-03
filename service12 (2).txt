@@ -1,0 +1,414 @@
+import uuid, time, traceback, logging, json, datetime, zipfile, io
+from azure.identity import ClientSecretCredential
+from azure.storage.fileshare import ShareServiceClient,ShareClient,ResourceTypes, AccountSasPermissions, generate_account_sas
+from azure.mgmt.storage import StorageManagementClient
+from bs4 import BeautifulSoup
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
+from datetime import datetime, timedelta, timezone
+import re
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("file_processor.log")
+    ]
+)
+
+# Configuration
+CONFIG = {
+    "tenant_id": "**************",
+    "client_id": "***************",
+    "client_secret": "*************",
+    "subscription_id": "*********************",
+    "resource_group": "fileprocess-rg1",
+    "STORAGE_ACCOUNT": "fileprocessorsk01",
+    "file_share": "test-share2",
+    "search_endpoint": "****************",
+    "search_index": "new-index",
+    "search_key": "***********************",
+    "poll_interval": 60,
+    "directory_path": "folder1/folder2"
+}
+
+def clean_text(text):
+    """Clean and normalize text by removing extra whitespace and converting newlines to commas."""
+    if not text:
+        return ""
+    if isinstance(text, str):
+        # Replace newlines with commas, then clean up multiple spaces
+        text = re.sub(r'\r?\n', ', ', text)  # Convert newlines to commas
+        text = re.sub(r'\s+', ' ', text).strip()  # Clean up multiple spaces
+        # Remove any remaining control characters
+        text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)
+        # Clean up multiple commas and extra spaces around commas
+        text = re.sub(r',\s*,+', ',', text)  # Multiple commas to single comma
+        text = re.sub(r'\s*,\s*', ', ', text)  # Normalize spaces around commas
+        text = text.strip(', ')  # Remove leading/trailing commas and spaces
+    return text
+
+def get_storage_key():
+    """Fetch the primary storage key using the Service Principal."""
+    try:
+        cred = ClientSecretCredential(
+            CONFIG["tenant_id"],
+            CONFIG["client_id"],
+            CONFIG["client_secret"]
+        )
+        mgmt_client = StorageManagementClient(cred, CONFIG["subscription_id"])
+        keys = mgmt_client.storage_accounts.list_keys(CONFIG["resource_group"], CONFIG["STORAGE_ACCOUNT"])
+        return keys.keys[0].value
+    except Exception as e:
+        logging.error(f"Failed to get storage key: {str(e)}")
+        raise
+
+def get_storage_client():
+    """Create ShareServiceClient with SAS token."""
+    try:
+        account_key = get_storage_key()
+        sas_token = generate_account_sas(
+            account_name=CONFIG["STORAGE_ACCOUNT"],
+            account_key=account_key,
+            resource_types=ResourceTypes(service=True, container=True, object=True),
+            permission=AccountSasPermissions(read=True, write=True, list=True, create=True, delete=True),
+            expiry=datetime.now(timezone.utc) + timedelta(hours=1)
+        )
+        return ShareServiceClient(
+            account_url=f"https://{CONFIG['STORAGE_ACCOUNT']}.file.core.windows.net/",
+            credential=sas_token
+        )
+    except Exception as e:
+        logging.error(f"Failed to create storage client: {str(e)}")
+        raise
+
+def extract_json_from_html(html_content):
+    """Extract JSON from HTML with robust error handling."""
+    try:
+        # First try BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
+        container = soup.find("div", {"id": "mocha-report"})
+        if container and container.get("data-jsonblob"):
+            json_str = container["data-jsonblob"]
+            logging.debug(f"Initial JSON string: {json_str[:200]}...")  # Log first 200 chars
+            
+            # Clean the JSON string
+            json_str = clean_text(json_str)
+            
+            # Try direct parse first
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logging.warning(f"Initial JSON parse failed: {str(e)}")
+                
+                # Try to fix common JSON issues
+                json_str = json_str.replace('\n', '\\n').replace('\r', '\\r')
+                json_str = re.sub(r'(?<!\\)"(?!(,"|":|"}|"]))', r'\"', json_str)
+                
+                # Try to complete unterminated strings
+                json_str = re.sub(r':\s*"[^"]*$', lambda m: m.group(0) + '"', json_str)
+                json_str = re.sub(r'"\s*:\s*"[^"]*$', lambda m: m.group(0) + '"', json_str)
+                
+                # Try parsing again
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    logging.warning(f"Repaired JSON parse failed: {str(e)}")
+                    
+                    # Final attempt - extract just the JSON part
+                    match = re.search(r'({.*})', json_str, re.DOTALL)
+                    if match:
+                        try:
+                            return json.loads(match.group(1))
+                        except json.JSONDecodeError:
+                            pass
+        
+        # Fallback to manual extraction if BeautifulSoup fails
+        match = re.search(r'<div[^>]id=["\']mocha-report["\'][^>]*data-jsonblob=["\']({.?})["\']', 
+                         html_content, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError as e:
+                logging.warning(f"Regex extraction failed: {str(e)}")
+        
+        # Last resort - find any JSON-like structure
+        matches = re.findall(r'({.*?})', html_content, re.DOTALL)
+        for match in matches:
+            try:
+                return json.loads(match)
+            except json.JSONDecodeError:
+                continue
+        
+        raise ValueError("No valid JSON blob could be extracted from HTML content")
+    
+    except Exception as e:
+        logging.error(f"Error in extract_json_from_html: {str(e)}")
+        raise
+
+def create_environment_zip(env_data):
+    """Create a zip file containing environment data and upload to Azure storage."""
+    try:
+        # Create zip file in memory
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # Create a single file with all environment data
+            env_content = []
+            env_content.append("=== ENVIRONMENT DATA ===\n")
+            
+            for key, value in env_data.items():
+                if isinstance(value, dict):
+                    env_content.append(f"\n[{key}]")
+                    for sub_key, sub_value in value.items():
+                        env_content.append(f"{sub_key}: {sub_value}")
+                else:
+                    env_content.append(f"\n{key}: {value}")
+            
+            # Write all environment data to a single file
+            all_env_data = "\n".join(env_content)
+            zip_file.writestr("environment_data.txt", all_env_data)
+        
+        zip_content = zip_buffer.getvalue()
+        zip_filename = f"env_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.zip"
+        
+        # Upload to Azure File Share
+        storage_client = get_storage_client()
+        share_client = storage_client.get_share_client(CONFIG["file_share"])
+        
+        # Create environment_zips directory if it doesn't exist
+        dir_client = share_client.get_directory_client("environment_zips")
+        try:
+            dir_client.create_directory()
+        except:
+            pass  # Directory likely already exists
+            
+        file_client = dir_client.get_file_client(zip_filename)
+        file_client.upload_file(zip_content)
+        
+        # Generate SAS URL for the file
+        account_key = get_storage_key()
+        sas_token = generate_account_sas(
+            account_name=CONFIG["STORAGE_ACCOUNT"],
+            account_key=account_key,
+            resource_types=ResourceTypes(object=True),
+            permission=AccountSasPermissions(read=True),
+            expiry=datetime.now(timezone.utc) + timedelta(days=365)
+        )
+        
+        return f"https://{CONFIG['STORAGE_ACCOUNT']}.file.core.windows.net/{CONFIG['file_share']}/environment_zips/{zip_filename}?{sas_token}"
+    
+    except Exception as e:
+        logging.error(f"Error creating/uploading zip: {str(e)}")
+        raise
+
+def process_file(file_path, file_client):
+    try:
+        logging.info(f"Processing file: {file_path}")
+        data = file_client.download_file().readall().decode("utf-8")
+        
+        # Save original file for debugging
+        with open("last_processed_file.html", "w", encoding="utf-8") as f:
+            f.write(data)
+        
+        # Extract JSON data with improved error handling
+        test_data = extract_json_from_html(data)
+        env_data = test_data.get("environment", {})
+        test_case = test_data.get("tests", [{}])[0]
+        
+        # Extract URLs from Links column in summary table if it exists
+        summary_links = []
+        
+        # Parse summary data from HTML to find Links column
+        soup = BeautifulSoup(data, "html.parser")
+        
+        # Look for table under Summary section
+        summary_section = soup.find("div", class_="summary")
+        if summary_section:
+            # Find table after summary section
+            table = summary_section.find_next("table")
+            if table:
+                # Find header row to locate Links column index
+                header_row = table.find("tr")
+                if header_row:
+                    headers = [th.get_text().strip().lower() for th in header_row.find_all(["th", "td"])]
+                    try:
+                        links_index = headers.index("links")
+                        # Extract all links from the Links column
+                        for row in table.find_all("tr")[1:]:  # Skip header row
+                            cells = row.find_all(["td", "th"])
+                            if len(cells) > links_index:
+                                links_cell = cells[links_index]
+                                # Extract all URLs from the Links cell
+                                cell_urls = re.findall(r'https?://[^\s<>"]+', str(links_cell))
+                                summary_links.extend(cell_urls)
+                    except ValueError:
+                        logging.warning("Links column not found in summary table")
+        
+        # If no Links column found, set as empty string
+        if not summary_links:
+            logging.info("No Links column found, setting path as empty string")
+            path_value = ""
+        else:
+            # Clean each URL and join with commas
+            cleaned_urls = [clean_text(url) for url in summary_links if url.strip()]
+            path_value = ", ".join(cleaned_urls)
+        
+        # Extract test duration from run-count
+        run_count_elem = soup.find("p", {"class": "run-count"})
+        duration_text = run_count_elem.get_text().strip() if run_count_elem else "test execution"
+        
+        # Find the result type with value > 0
+        result_type = "unknown"
+        result_spans = soup.find_all("span", class_=["failed", "passed", "skipped", "xfailed", "xpassed", "error", "rerun"])
+        for span in result_spans:
+            span_text = span.get_text().strip()
+            # Extract number from text like "1 Failed", "0 Passed", etc.
+            match = re.match(r'(\d+)\s+(.+)', span_text)
+            if match and int(match.group(1)) > 0:
+                result_type = match.group(2)
+                break
+        
+        # Extract additional fields from test data
+        test_id = test_case.get("testId", "")
+        duration_value = test_case.get("duration", "")
+        error_messages = test_case.get("error", "")
+        
+        # Extract image content from extras array
+        image_value = ""
+        extras = test_case.get("extras", [])
+        for extra in extras:
+            if extra.get("format_type") == "image":
+                image_value = extra.get("content", "")
+                break
+        
+        # Format sentence as requested
+        sentence_text = f"Summary: {duration_text}, Result: {result_type}, Duration: {duration_value}, Testid: {test_id}, Image: {image_value}, Error messages: {error_messages}"
+        
+        # Get test title and format it
+        test_title = test_case.get("testId", "").split("::")[-1]
+        formatted_title = f"Title: {test_title}"
+        
+        # Prepare document for Azure Search with cleaned fields
+        doc = {
+            "id": str(uuid.uuid4()),
+            "baseUrl": "",  # Empty string as requested
+            "path": path_value,
+            "title": clean_text(formatted_title),
+            "sentence": clean_text(sentence_text),
+            "summary_content": "",  # Empty string as requested
+            "Environment": create_environment_zip(env_data)
+        }
+        
+        # Safe logging of document
+        log_doc = doc.copy()
+        log_doc["Environment"] = f"[ZIP_URL:{log_doc['Environment']}]"
+        logging.debug(f"Prepared document: {json.dumps(log_doc, indent=2)}")
+        
+        if push_to_search(doc):
+            return "processed"
+        return "error"
+
+    except Exception as e:
+        logging.error(f"Error processing {file_path}: {str(e)}\n{traceback.format_exc()}")
+        return "error"
+
+def push_to_search(doc):
+    try:
+        logging.info(f"Pushing document to search index: {doc['id']}")
+        client = SearchClient(
+            endpoint=CONFIG["search_endpoint"],
+            index_name=CONFIG["search_index"],
+            credential=AzureKeyCredential(CONFIG["search_key"])
+        )
+        
+        # Convert the document to ensure all fields are JSON serializable
+        search_doc = {
+            "id": doc["id"],
+            "baseUrl": doc["baseUrl"],
+            "path": doc["path"],
+            "title": doc["title"],
+            "sentence": doc["sentence"],
+            "summary_content": doc["summary_content"],
+            "Environment": doc["Environment"]
+        }
+        
+        result = client.upload_documents(documents=[search_doc])
+        if result and len(result) > 0:
+            if result[0].succeeded:
+                logging.info(f"Successfully uploaded document {doc['id']}")
+                return True
+            else:
+                logging.error(f"Failed to upload document: {result[0].error_message}")
+        else:
+            logging.error("Empty response from search client")
+        return False
+    except Exception as e:
+        logging.error(f"Search client error: {str(e)}\n{traceback.format_exc()}")
+        return False
+
+def move_file(file_client, status):
+    # Generate SAS token again (or reuse a global one)
+    account_key = get_storage_key()
+    sas_token = generate_account_sas(
+        account_name=CONFIG["STORAGE_ACCOUNT"],
+        account_key=account_key,
+        resource_types=ResourceTypes(service=True, container=True, object=True),
+        permission=AccountSasPermissions(read=True, write=True, list=True, create=True, delete=True),
+        #expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    )
+
+    share_client = ShareClient(
+        account_url=f"https://{CONFIG['STORAGE_ACCOUNT']}.file.core.windows.net/",
+        share_name=CONFIG["file_share"],
+        credential=sas_token
+    )
+
+    dest_dir_client = share_client.get_directory_client(status)
+    try:
+        dest_dir_client.create_directory()
+        logging.info(f"Created directory: {status}")
+    except Exception:
+        logging.info(f"Directory {status} already exists.")
+
+    dest_file = dest_dir_client.get_file_client(file_client.file_name)
+    file_content = file_client.download_file().readall()
+    dest_file.upload_file(file_content)
+    logging.info(f"Uploaded file to {status}/ directory.")
+    file_client.delete_file()
+    logging.info(f"Deleted original file: {file_client.file_name}")
+
+
+def main():
+    try:
+        logging.info("Starting main process")
+        service_client = get_storage_client()
+        share_client = service_client.get_share_client(CONFIG["file_share"])
+        dir_client = share_client.get_directory_client(CONFIG["directory_path"])
+
+        files = list(dir_client.list_directories_and_files())
+        logging.info(f"Found {len(files)} items in directory")
+        
+        for file in files:
+            if file["name"].endswith(".html"):
+                logging.info(f"Processing HTML file: {file['name']}")
+                file_client = dir_client.get_file_client(file["name"])
+                status = process_file(file["name"], file_client)
+                logging.info(f"File {file['name']} processed with status: {status}")
+                move_file(file_client, status)
+                break
+            else:
+                logging.info(f"Skipping non-HTML file: {file['name']}")
+            logging.info("Main Process Completed.")    
+
+    except Exception as e:
+        logging.error(f"Error in main process: {str(e)}\n{traceback.format_exc()}")
+
+if __name__ == "__main__":
+    logging.info("Starting File Processor Service")
+    #while True:
+    main()
+        #time.sleep(CONFIG["poll_interval"])
