@@ -1,0 +1,331 @@
+import uuid, time, traceback, logging, json, datetime, zipfile, io, logging, re
+from azure.identity import ClientSecretCredential
+from azure.storage.fileshare import ShareClient,ShareServiceClient, ResourceTypes, AccountSasPermissions, generate_account_sas
+from azure.mgmt.storage import StorageManagementClient
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
+from datetime import datetime, timedelta, timezone
+from bs4 import BeautifulSoup
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ENV variables (from AKS secret)
+
+
+def get_storage_key():
+    """Fetch the primary storage key using the Service Principal."""
+    cred = ClientSecretCredential(TENANT_ID, CLIENT_ID, CLIENT_SECRET)
+    mgmt_client = StorageManagementClient(cred, SUBSCRIPTION_ID)
+    keys = mgmt_client.storage_accounts.list_keys(RESOURCE_GROUP, STORAGE_ACCOUNT)
+    return keys.keys[0].value
+
+def get_storage_client():
+    """Generate a SAS token using the storage account key and create ShareServiceClient."""
+    logging.info("Generating SAS token for Azure File Share.")
+    account_key = get_storage_key()
+    sas_token = generate_account_sas(
+        account_name=STORAGE_ACCOUNT,
+        account_key=account_key,
+        resource_types=ResourceTypes(service=True, container=True, object=True),
+        permission=AccountSasPermissions(read=True, write=True, list=True, create=True, delete=True),
+        #expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    )
+    return ShareServiceClient(
+        account_url=f"https://{STORAGE_ACCOUNT}.file.core.windows.net/",
+        credential=sas_token
+    )
+
+def process_file(file_path, file_client):
+    logging.info(f"Processing file: {file_path}")
+    try:
+        data = file_client.download_file().readall().decode("utf-8")
+        
+        # Parse HTML with BeautifulSoup
+        soup = BeautifulSoup(data, "html.parser")
+        container = soup.find("div", {"id": "data-container"})
+
+        json_blob = None
+        if container:
+            json_blob = container.get("data-jsonblob")
+
+        if not json_blob or json_blob.strip() == "{":
+            # Fallback: Use regex to find the data-jsonblob manually
+            logging.warning("Falling back to regex to extract data-jsonblob")
+            # Find the start of data-jsonblob attribute
+            start_pattern = r'data-jsonblob=["\']\s*'
+            start_match = re.search(start_pattern, data)
+            if start_match:
+                start_pos = start_match.end()
+                # Find the end pattern: quote followed by "></div>
+                end_pattern = r'["\']\s*></div>'
+                end_match = re.search(end_pattern, data[start_pos:])
+                if end_match:
+                    end_pos = start_pos + end_match.start()
+                    json_blob = data[start_pos:end_pos]
+                else:
+                    logging.warning("Could not find end of data-jsonblob")
+            else:
+                logging.warning("Could not find start of data-jsonblob")
+
+        if not json_blob:
+            logging.warning("data-jsonblob not found or empty.")
+            return "error"
+
+        try:
+            # Strip leading/trailing whitespace from JSON blob
+            json_blob = json_blob.strip()
+            parsed_data = json.loads(json_blob)
+        except Exception as e:
+            logging.warning(f"Extracted data-jsonblob is not valid JSON: {e}")
+            logging.warning(f"Raw JSON blob (first 200 chars): {repr(json_blob[:200])}")
+            return "error"
+
+        # Extract run count summary from HTML
+        run_count_element = soup.find("p", {"class": "run-count"})
+        summary = ""
+        if run_count_element:
+            summary = f"Summary: {run_count_element.get_text().strip()}"
+        
+        # Extract base URL
+        base_url = parsed_data.get("environment", {}).get("Base URL", "")
+        
+        # Extract test data
+        tests = parsed_data.get("tests", {})
+        
+        results = []
+        for test_key, test_data_list in tests.items():
+            # Extract title from test key (e.g., "processor/Improve_code_OTC.py::test_go_to_centerwellpharmacy")
+            test_name = test_key.split("::")[-1] if "::" in test_key else test_key.split("/")[-1]
+            title = f"{test_name}"
+            
+            for test_data in test_data_list:
+                # Extract path from col-links in resultsTableRow
+                path = ""
+                if "resultsTableRow" in test_data and len(test_data["resultsTableRow"]) > 3:
+                    links_td = test_data["resultsTableRow"][3]
+                    # Parse the links TD to extract any href or content
+                    links_soup = BeautifulSoup(links_td, "html.parser")
+                    link = links_soup.find("a")
+                    if link and link.get("href"):
+                        path = link.get("href")
+                
+                # Extract other fields
+                test_id = f"Testid: {test_data.get('testId', '')}"
+                duration = f"Duration: {test_data.get('duration', '')}"
+                result_status = f"Result: {test_data.get('result', '')}"
+                
+                # Extract image data and error messages
+                image_data = ""
+                error_messages = ""
+                
+                # Extract image data from extras
+                if "extras" in test_data:
+                    for extra in test_data["extras"]:
+                        if extra.get("format_type") == "image":
+                            image_data = {
+                                "name": extra.get("name"),
+                                "format_type": extra.get("format_type"),
+                                "content": extra.get("content"),
+                                "mime_type": extra.get("mime_type"),
+                                "extension": extra.get("extension")
+                            }
+                
+                # Extract error messages from log field
+                if "log" in test_data and test_data["log"]:
+                    error_messages = test_data["log"]
+                
+                # Create zip file with environment data
+                environment_data = parsed_data.get("environment", {})
+                environment_zip_url = create_environment_zip(environment_data, file_path)
+                
+                # Combine all fields into sentence
+                sentence_parts = [
+                    summary,
+                    test_id,
+                    duration,
+                    result_status
+                ]
+                
+                if image_data:
+                    sentence_parts.append(f"Image: {json.dumps(image_data)}")
+                
+                if error_messages:
+                    sentence_parts.append(f"Error Messages: {error_messages}")
+                
+                # Format sentence parts as HTML with one <p> tag and <br> for line breaks
+                filtered_parts = list(filter(None, sentence_parts))
+                if filtered_parts:
+                    combined_sentence = "<p>" + "<br>".join(filtered_parts) + "</p>"
+                else:
+                    combined_sentence = ""
+                
+                # Create result document
+                result_doc = {
+                    "id": str(uuid.uuid4()),
+                    "baseUrl": base_url,
+                    "path": path,
+                    "title": title,
+                    "sentence": combined_sentence,
+                    "summary_content": "",
+                    "environment": create_environment_hyperlink(environment_zip_url, environment_data)
+                }
+                
+                results.append(result_doc)
+        
+        # Push all results to search
+        for result in results:
+            push_to_search(result)
+        
+        logging.info(f"File processed successfully: {file_path}")
+        return "processed"
+
+    except Exception:
+        logging.error(f"Error processing file {file_path}: {traceback.format_exc()}")
+        return "error"
+
+def create_environment_hyperlink(environment_zip_url, environment_data):
+    """
+    Create environment hyperlink - either zip download or inline data display.
+    """
+    if environment_zip_url:
+        # Zip creation successful - return download link
+        return f'<a href="{environment_zip_url}" target="_blank">Download Environment</a>'
+    elif environment_data:
+        # Zip creation failed but we have environment data - show inline
+        env_summary = []
+        for key, value in environment_data.items():
+            if isinstance(value, (str, int, float, bool)):
+                env_summary.append(f"{key}: {value}")
+        
+        if env_summary:
+            env_text = "<br>".join(env_summary[:5])  # Show first 5 items
+            if len(environment_data) > 5:
+                env_text += "<br>... (and more)"
+            return f'<div title="Environment Data">{env_text}</div>'
+    
+    # No environment data available
+    return "No environment data available"
+
+def create_environment_zip(environment_data, original_file_path):
+    """
+    Create a zip file containing environment data and upload it to Azure Storage.
+    Returns the download URL for the zip file.
+    """
+    try:
+        # Create a zip file in memory
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # Create environment.json file with all environment data
+            env_json = json.dumps(environment_data, indent=2)
+            zip_file.writestr("environment.json", env_json)
+        
+        zip_buffer.seek(0)
+        
+        # Generate unique filename for the zip
+        zip_filename = f"environment_{uuid.uuid4().hex[:8]}.zip"
+        
+        # Upload zip to Azure Storage
+        account_key = get_storage_key()
+        sas_token = generate_account_sas(
+            account_name=STORAGE_ACCOUNT,
+            account_key=account_key,
+            resource_types=ResourceTypes(service=True, container=True, object=True),
+            permission=AccountSasPermissions(read=True, write=True, list=True, create=True, delete=True),
+            expiry=datetime.now(timezone.utc) + timedelta(hours=24*30)  # 30 days expiry
+        )
+        
+        share_client = ShareClient(
+            account_url=f"https://{STORAGE_ACCOUNT}.file.core.windows.net/",
+            share_name=FILE_SHARE,
+            credential=sas_token
+        )
+        
+        # Create zip directory if it doesn't exist
+        zip_dir_client = share_client.get_directory_client("folder1/environment-zips")
+        try:
+            zip_dir_client.create_directory()
+        except Exception:
+            pass  # Directory might already exist
+        
+        # Upload the zip file
+        zip_file_client = zip_dir_client.get_file_client(zip_filename)
+        zip_file_client.upload_file(zip_buffer.getvalue())
+        
+        # Generate download URL
+        download_url = f"https://{STORAGE_ACCOUNT}.file.core.windows.net/{FILE_SHARE}/folder1/environment-zips/{zip_filename}?{sas_token}"
+        
+        logging.info(f"Environment zip created and uploaded: {zip_filename}")
+        return download_url
+        
+    except Exception as e:
+        logging.error(f"Failed to create environment zip for {original_file_path}: {traceback.format_exc()}")
+        logging.info("Environment will be displayed inline instead of as downloadable zip")
+        return ""
+
+def push_to_search(doc):
+    try:
+        logging.info(f"Pushing document to Azure AI Search: {doc['id']}")
+        client = SearchClient(endpoint=SEARCH_ENDPOINT, index_name=SEARCH_INDEX,
+                              credential=AzureKeyCredential(SEARCH_KEY))
+        client.upload_documents(documents=[doc])
+        logging.info("Document uploaded to search.")
+    except Exception:
+        logging.error(f"Failed to push document to search: {traceback.format_exc()}")
+
+def move_file(file_client, status):
+    # Generate SAS token again (or reuse a global one)
+    account_key = get_storage_key()
+    sas_token = generate_account_sas(
+        account_name=STORAGE_ACCOUNT,
+        account_key=account_key,
+        resource_types=ResourceTypes(service=True, container=True, object=True),
+        permission=AccountSasPermissions(read=True, write=True, list=True, create=True, delete=True),
+        #expiry=datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    )
+
+    share_client = ShareClient(
+        account_url=f"https://{STORAGE_ACCOUNT}.file.core.windows.net/",
+        share_name=FILE_SHARE,
+        credential=sas_token
+    )
+
+    dest_dir_client = share_client.get_directory_client(f"folder1/{status}")
+    try:
+        dest_dir_client.create_directory()
+        logging.info(f"Created directory: {status}")
+    except Exception:
+        logging.info(f"Directory {status} already exists.")
+
+    dest_file = dest_dir_client.get_file_client(file_client.file_name)
+    file_content = file_client.download_file().readall()
+    dest_file.upload_file(file_content)
+    logging.info(f"Uploaded file to {status}/ directory.")
+    file_client.delete_file()
+    logging.info(f"Deleted original file: {file_client.file_name}")
+
+
+def main():
+    logging.info("Starting main process.")
+    service_client = get_storage_client()
+    share_client = service_client.get_share_client(FILE_SHARE)
+    dir_client = share_client.get_directory_client("folder1/folder2")
+
+    try:
+        for file in dir_client.list_directories_and_files():
+            if file["name"].endswith(".html"):
+                logging.info(f"Found HTML file: {file['name']}")
+                file_client = dir_client.get_file_client(file["name"])
+                status = process_file(f"folder1/folder2/{file['name']}", file_client)
+                move_file(file_client, status)
+    except Exception:
+        logging.error(f"Error listing or processing files: {traceback.format_exc()}")
+
+    logging.info("Main process completed.")
+
+if _name_ == "_main_":
+    logging.info("Starting File Processor Service")
+    while True:
+        main()
+        time.sleep(POLL_INTERVAL)
